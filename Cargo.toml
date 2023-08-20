@@ -1,0 +1,25 @@
+[package]
+name = "sound_sense"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+hostname = "0.3"
+socket2 = "0.5"
+get_if_addrs = "0.5"
+cpal = "0.15"
+hound = "3.4"
+
+
+# Logging
+log = "0.4"
+env_logger = "0.10"
+colored = "2.0"
+
+# Other
+chrono = "0.4"
+whisper-rs = "0.8"
+signal-hook = "0.3"
+num_cpus = "1.13"

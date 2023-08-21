@@ -6,5 +6,16 @@ This is a personal project and runs on an [Orange Pi 5B](http://www.orangepi.org
 
 Make sure to set up the appropriate path to the Whisper model:
 
+
 ```rust
 let model_path = "/home/alexwoolford/whisper.cpp/models/ggml-small.en.bin";
+```
+<!-- 
+- [ ] TODO: only create WAV files when there's noise/speech
+- [ ] TODO: try and use Orange Pi's GPU so the CPU isn't pegged all the time
+- [ ] TODO: create iterate transcription test(s) to figure out what the best combinations of params is for the Orange Pi 5B
+- [ ] TODO: persist the transcriptions
+- [ ] TODO: capture real timestamps in the transcriptions
+- [ ] TODO: chatGPT API call to periodically summarize transcripts
+-->
+

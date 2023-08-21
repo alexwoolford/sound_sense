@@ -164,7 +164,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // 1. Instantiate the TranscriptionService after initializing the logger
     // let model_path = "/home/alexwoolford/whisper.cpp/models/ggml-medium.en.bin";
-    let model_path = "/home/alexwoolford/whisper.cpp/models/ggml-small.en.bin";
+    // let model_path = "/home/alexwoolford/whisper.cpp/models/ggml-small.en.bin";
+    let model_path = "/home/alexwoolford/whisper.cpp/models/ggml-base.en.bin";
     let transcription_service = Arc::new(TranscriptionService::new(model_path)?);
 
 
@@ -265,11 +266,10 @@ impl TranscriptionService {
 
     fn transcribe_audio(&self, path: &str) {
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
 
-        params.set_n_threads(6);
+        params.set_n_threads(8);
         params.set_language(Some("en"));
-
 
         // Read the audio data from the provided path
         info!("Attempting to open file: {}", path);
@@ -283,6 +283,12 @@ impl TranscriptionService {
 
         let audio_data: Vec<f32> = reader.samples::<i32>().map(|s| i32_to_f32(s.unwrap())).collect();
 
+        let spec = reader.spec();
+        let total_samples = reader.len() as f32;
+        let audio_duration_seconds = total_samples / (spec.sample_rate as f32 * spec.channels as f32);
+
+        let transcribe_start = Instant::now();
+
         // Transcribe the audio using the already loaded ctx from the struct
         let mut state = self.ctx.create_state().expect("failed to create state");
         state
@@ -295,6 +301,8 @@ impl TranscriptionService {
 
         info!("There were {} segments.", num_segments);
 
+        let mut transcription_content = String::new();
+
         for i in 0..num_segments {
             info!("Processing segment {}", i);
             let segment = state
@@ -306,7 +314,32 @@ impl TranscriptionService {
             let end_timestamp = state
                 .full_get_segment_t1(i)
                 .expect("failed to get segment end timestamp");
-            info!("[{} - {}]: {}", start_timestamp, end_timestamp, segment);
+            let segment_info = format!("[{} - {}]: {}\n", start_timestamp, end_timestamp, segment);
+            info!("{}", &segment_info);
+
+            // Append this segment's transcription to the full content
+            transcription_content.push_str(&segment_info);
         }
+
+        // Save the transcription to a file
+        if let Err(e) = self.save_transcription_to_file(path, &transcription_content) {
+            error!("Failed to save transcription to a file: {}", e);
+        }
+
+        let transcribe_duration = transcribe_start.elapsed();
+        let transcribe_duration_seconds = transcribe_duration.as_secs_f32();
+        info!("{}, {:.3} seconds of audio, transcribed in {:.3} seconds", path, audio_duration_seconds, transcribe_duration_seconds);
+
     }
+
+    fn save_transcription_to_file(&self, path: &str, content: &str) -> Result<(), std::io::Error> {
+        use std::fs::File;
+        use std::io::prelude::*;
+
+        let txt_path = path.replace(".wav", ".txt");
+        let mut file = File::create(txt_path)?;
+        file.write_all(content.as_bytes())?;
+        Ok(())
+    }
+
 }

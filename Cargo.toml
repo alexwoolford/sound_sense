@@ -20,6 +20,6 @@ colored = "2.0"
 
 # Other
 chrono = "0.4"
-whisper-rs = "0.8"
+whisper-rs = { version = "0.8", features = ["opencl"] }
 signal-hook = "0.3"
 num_cpus = "1.13"

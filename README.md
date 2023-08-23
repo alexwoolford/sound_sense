@@ -14,8 +14,17 @@ let model_path = "/home/alexwoolford/whisper.cpp/models/ggml-small.en.bin";
 - [ ] TODO: only create WAV files when there's noise/speech
 - [ ] TODO: try and use Orange Pi's GPU so the CPU isn't pegged all the time
 - [ ] TODO: create iterate transcription test(s) to figure out what the best combinations of params is for the Orange Pi 5B
-- [ ] TODO: persist the transcriptions
-- [ ] TODO: capture real timestamps in the transcriptions
+- [X] TODO: persist the transcriptions
+- [X] TODO: capture real timestamps in the transcriptions
 - [ ] TODO: chatGPT API call to periodically summarize transcripts
+- [ ] TODO: speech patterns (words per minute)
+- [ ] TODO: how much attention from the audience (is it a conversation, or a monologue)
+- [ ] TODO: haptic feedback in real time
+- [ ] TODO: sentiment analysis
+- [ ] TODO: real-time feedback (slow down, speed up, pause for questions)
+- [ ] TODO: speaker identification
+- [ ] TODO: voice stress analysis
+- [ ] TODO: feedback via autocue
+- [ ] TODO: context based search on another screen
 -->
 

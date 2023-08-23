@@ -10,7 +10,9 @@ use hound;
 use cpal::{SampleRate, StreamConfig};
 use log::{error, info};
 use chrono::prelude::*;
+use chrono::Duration as ChronoDuration;
 use whisper_rs::{WhisperContext, FullParams, SamplingStrategy};
+use serde::Serialize;
 
 use crate::initialization::init_logger;
 
@@ -40,6 +42,19 @@ fn is_receiver_empty<T>(rx: &mpsc::Receiver<T>) -> bool {
 fn i32_to_f32(sample: i32) -> f32 {
     const MAX_I32_AS_F32: f32 = std::i32::MAX as f32;
     sample as f32 / MAX_I32_AS_F32
+}
+
+#[derive(Serialize)]
+struct TranscriptionSegment {
+    start: String,
+    end: String,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct FullTranscription {
+    file_name: String,
+    transcriptions: Vec<TranscriptionSegment>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -163,11 +178,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     // 1. Instantiate the TranscriptionService after initializing the logger
-    // let model_path = "/home/alexwoolford/whisper.cpp/models/ggml-medium.en.bin";
-    // let model_path = "/home/alexwoolford/whisper.cpp/models/ggml-small.en.bin";
     let model_path = "/home/alexwoolford/whisper.cpp/models/ggml-base.en.bin";
     let transcription_service = Arc::new(TranscriptionService::new(model_path)?);
-
 
     let transcription = {
         let ready_for_transcription = Arc::clone(&ready_for_transcription);
@@ -301,28 +313,45 @@ impl TranscriptionService {
 
         info!("There were {} segments.", num_segments);
 
-        let mut transcription_content = String::new();
+        let current_filename = get_filename_with_timestamp();
+        let base_time = Utc.datetime_from_str(&current_filename, "audio_%Y%m%d%H%M%S.wav")
+            .expect("Failed to parse timestamp from filename");
+
+        let mut transcription_segments = Vec::new();
 
         for i in 0..num_segments {
-            info!("Processing segment {}", i);
-            let segment = state
-                .full_get_segment_text(i)
-                .expect("failed to get segment");
-            let start_timestamp = state
-                .full_get_segment_t0(i)
-                .expect("failed to get segment start timestamp");
-            let end_timestamp = state
-                .full_get_segment_t1(i)
-                .expect("failed to get segment end timestamp");
-            let segment_info = format!("[{} - {}]: {}\n", start_timestamp, end_timestamp, segment);
-            info!("{}", &segment_info);
+            match state.full_get_segment_text(i) {
+                Ok(segment) => {
+                    let start_timestamp = state
+                        .full_get_segment_t0(i)
+                        .expect("failed to get segment start timestamp");
+                    let end_timestamp = state
+                        .full_get_segment_t1(i)
+                        .expect("failed to get segment end timestamp");
 
-            // Append this segment's transcription to the full content
-            transcription_content.push_str(&segment_info);
+                    let start_time = base_time + ChronoDuration::milliseconds(start_timestamp);
+                    let end_time = base_time + ChronoDuration::milliseconds(end_timestamp);
+
+                    let segment_info = TranscriptionSegment {
+                        start: start_time.to_rfc3339(),
+                        end: end_time.to_rfc3339(),
+                        text: segment,
+                    };
+
+                    transcription_segments.push(segment_info);
+                },
+                Err(_) => {}
+            }
         }
 
-        // Save the transcription to a file
-        if let Err(e) = self.save_transcription_to_file(path, &transcription_content) {
+        let full_transcription = FullTranscription {
+            file_name: current_filename,
+            transcriptions: transcription_segments,
+        };
+
+        // Serialize full_transcription to JSON and save it
+        let json_data = serde_json::to_string_pretty(&full_transcription).unwrap();
+        if let Err(e) = self.save_transcription_to_file(path, &json_data) {
             error!("Failed to save transcription to a file: {}", e);
         }
 
@@ -335,6 +364,8 @@ impl TranscriptionService {
     fn save_transcription_to_file(&self, path: &str, content: &str) -> Result<(), std::io::Error> {
         use std::fs::File;
         use std::io::prelude::*;
+
+        info!("saving transcription to: {}", path);
 
         let txt_path = path.replace(".wav", ".txt");
         let mut file = File::create(txt_path)?;

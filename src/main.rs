@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::error::Error;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use get_if_addrs::get_if_addrs;
@@ -21,9 +22,9 @@ mod initialization;
 use signal_hook::{iterator::Signals};
 use signal_hook::consts::SIGINT;
 
+const EXCLUSION_TERMS: [&str; 4] = ["[silence]", "(Silence)", "[BLANK_AUDIO]", "[ Silence ]"];
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
-
 
 fn get_filename_with_timestamp() -> String {
     let now = Utc::now();
@@ -278,7 +279,7 @@ impl TranscriptionService {
 
     fn transcribe_audio(&self, path: &str) {
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
         params.set_n_threads(8);
         params.set_language(Some("en"));
@@ -319,26 +320,33 @@ impl TranscriptionService {
 
         let mut transcription_segments = Vec::new();
 
+        let exclusion_set: HashSet<_> = EXCLUSION_TERMS.iter().map(|&s| s.to_string()).collect();
+
         for i in 0..num_segments {
             match state.full_get_segment_text(i) {
                 Ok(segment) => {
-                    let start_timestamp = state
-                        .full_get_segment_t0(i)
-                        .expect("failed to get segment start timestamp");
-                    let end_timestamp = state
-                        .full_get_segment_t1(i)
-                        .expect("failed to get segment end timestamp");
+                    let trimmed_text = segment.trim().to_string();
 
-                    let start_time = base_time + ChronoDuration::milliseconds(start_timestamp);
-                    let end_time = base_time + ChronoDuration::milliseconds(end_timestamp);
+                    // Check if the trimmed text is not in the exclusion set
+                    if !exclusion_set.contains(&trimmed_text) {
+                        let start_timestamp = state
+                            .full_get_segment_t0(i)
+                            .expect("failed to get segment start timestamp");
+                        let end_timestamp = state
+                            .full_get_segment_t1(i)
+                            .expect("failed to get segment end timestamp");
 
-                    let segment_info = TranscriptionSegment {
-                        start: start_time.to_rfc3339(),
-                        end: end_time.to_rfc3339(),
-                        text: segment,
-                    };
+                        let start_time = base_time + ChronoDuration::milliseconds(start_timestamp);
+                        let end_time = base_time + ChronoDuration::milliseconds(end_timestamp);
 
-                    transcription_segments.push(segment_info);
+                        let segment_info = TranscriptionSegment {
+                            start: start_time.to_rfc3339(),
+                            end: end_time.to_rfc3339(),
+                            text: trimmed_text,
+                        };
+
+                        transcription_segments.push(segment_info);
+                    }
                 },
                 Err(_) => {}
             }
@@ -367,8 +375,8 @@ impl TranscriptionService {
 
         info!("saving transcription to: {}", path);
 
-        let txt_path = path.replace(".wav", ".txt");
-        let mut file = File::create(txt_path)?;
+        let json_path = path.replace(".wav", ".json");
+        let mut file = File::create(json_path)?;
         file.write_all(content.as_bytes())?;
         Ok(())
     }

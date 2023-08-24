@@ -10,8 +10,30 @@ Make sure to set up the appropriate path to the Whisper model:
 ```rust
 let model_path = "/home/alexwoolford/whisper.cpp/models/ggml-small.en.bin";
 ```
+
+The executable transcribes audio to timestamped JSON files:
+
+    {
+        "file_name": "audio_20230824011133.wav",
+        "transcriptions": [
+            {
+                "start": "2023-08-24T01:11:33.900+00:00",
+                "end": "2023-08-24T01:11:34+00:00",
+                "text": "Blessed be the fruit."
+            },
+            {
+                "start": "2023-08-24T01:11:34+00:00",
+                "end": "2023-08-24T01:11:34.100+00:00",
+                "text": "May the Lord open."
+            },
+            {
+                ...
+            {
+        ]
+    }
+
 <!-- 
-- [ ] TODO: only create WAV files when there's noise/speech
+- [X] TODO: only create WAV files when there's noise/speech
 - [ ] TODO: try and use Orange Pi's GPU so the CPU isn't pegged all the time
 - [ ] TODO: create iterate transcription test(s) to figure out what the best combinations of params is for the Orange Pi 5B
 - [X] TODO: persist the transcriptions
@@ -24,7 +46,8 @@ let model_path = "/home/alexwoolford/whisper.cpp/models/ggml-small.en.bin";
 - [ ] TODO: real-time feedback (slow down, speed up, pause for questions)
 - [ ] TODO: speaker identification
 - [ ] TODO: voice stress analysis
-- [ ] TODO: feedback via autocue
 - [ ] TODO: context based search on another screen
+- [X] TODO: trim text in JSON
+- [ ] TODO: show example of output in README.md
+- [X] TODO: rename transcript filetype to JSON
 -->
-

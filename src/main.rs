@@ -1,28 +1,32 @@
 use std::collections::HashSet;
 use std::error::Error;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use get_if_addrs::get_if_addrs;
-use hostname;
+use std::fs::File;
+use std::io::prelude::*;
 use std::sync::{Arc, Condvar, mpsc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use hound;
 
-use cpal::{SampleRate, StreamConfig};
-use log::{error, info};
-use chrono::prelude::*;
 use chrono::Duration as ChronoDuration;
-use whisper_rs::{WhisperContext, FullParams, SamplingStrategy};
+use chrono::prelude::*;
+use cpal::{SampleRate, StreamConfig};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use get_if_addrs::get_if_addrs;
+use hostname;
+use hound;
+use log::{error, info};
 use serde::Serialize;
+use signal_hook::consts::SIGINT;
+use signal_hook::iterator::Signals;
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext};
 
 use crate::initialization::init_logger;
 
 mod initialization;
 
-use signal_hook::{iterator::Signals};
-use signal_hook::consts::SIGINT;
-
+const DEFAULT_N_THREADS: i32 = 32;
+const DEFAULT_CHANNELS: u16 = 6;
 const EXCLUSION_TERMS: [&str; 4] = ["[silence]", "(Silence)", "[BLANK_AUDIO]", "[ Silence ]"];
+
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -41,7 +45,7 @@ fn is_receiver_empty<T>(rx: &mpsc::Receiver<T>) -> bool {
 }
 
 fn i32_to_f32(sample: i32) -> f32 {
-    const MAX_I32_AS_F32: f32 = std::i32::MAX as f32;
+    const MAX_I32_AS_F32: f32 = i32::MAX as f32;
     sample as f32 / MAX_I32_AS_F32
 }
 
@@ -163,7 +167,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                             }
                         };
                     }
-
                 }
                 Err(_) => {
                     // Log the error when we cannot receive any more samples (this should happen when tx is dropped).
@@ -175,7 +178,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         writer.finalize().unwrap();
         info!("wav_writer thread finished...");
-
     });
 
     // 1. Instantiate the TranscriptionService after initializing the logger
@@ -202,26 +204,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                     transcription_service_clone.transcribe_audio(&filename);
                 }
             }
-
         })
     };
 
     let config = StreamConfig {
-        channels: 6,
+        channels: DEFAULT_CHANNELS,
         sample_rate: SampleRate(16000),
         buffer_size: cpal::BufferSize::Default,
     };
 
     let channel_to_capture = 0; // This means first channel. Adjust if your microphone is on another channel.
-    let total_channels = 6;
+    let total_channels = DEFAULT_CHANNELS;
 
     // Inside your input stream callback, send samples to the writer:
     let stream = device.build_input_stream(
         &config,
         move |data: &[i32], _: &cpal::InputCallbackInfo| {
-
             for (idx, &sample) in data.iter().enumerate() {
-                if idx % total_channels == channel_to_capture {
+                if idx % (total_channels as usize) == channel_to_capture {
                     match tx.send(sample) {
                         Ok(_) => continue,
                         Err(e) => {
@@ -231,16 +231,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-
         },
         |err| error!("An error occurred on stream: {}", err),
-        None
+        None,
     )?;
 
     stream.play()?;
 
     while RUNNING.load(Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(Duration::from_secs(1));
     }
 
     // Stop the audio input stream FIRST
@@ -263,7 +262,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     info!("transcription joined, exiting...");
 
     Ok(())
-
 }
 
 // New struct to hold the WhisperContext
@@ -278,10 +276,9 @@ impl TranscriptionService {
     }
 
     fn transcribe_audio(&self, path: &str) {
-
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
-        params.set_n_threads(8);
+        params.set_n_threads(DEFAULT_N_THREADS);
         params.set_language(Some("en"));
 
         // Read the audio data from the provided path
@@ -347,7 +344,7 @@ impl TranscriptionService {
 
                         transcription_segments.push(segment_info);
                     }
-                },
+                }
                 Err(_) => {}
             }
         }
@@ -366,13 +363,9 @@ impl TranscriptionService {
         let transcribe_duration = transcribe_start.elapsed();
         let transcribe_duration_seconds = transcribe_duration.as_secs_f32();
         info!("{}, {:.3} seconds of audio, transcribed in {:.3} seconds", path, audio_duration_seconds, transcribe_duration_seconds);
-
     }
 
     fn save_transcription_to_file(&self, path: &str, content: &str) -> Result<(), std::io::Error> {
-        use std::fs::File;
-        use std::io::prelude::*;
-
         info!("saving transcription to: {}", path);
 
         let json_path = path.replace(".wav", ".json");
@@ -380,5 +373,4 @@ impl TranscriptionService {
         file.write_all(content.as_bytes())?;
         Ok(())
     }
-
 }

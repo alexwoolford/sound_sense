@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 
 use chrono::Duration as ChronoDuration;
 use chrono::prelude::*;
+use clap::{arg, command, value_parser};
+use std::path::PathBuf;
 use cpal::{SampleRate, StreamConfig};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use get_if_addrs::get_if_addrs;
-use hostname;
 use hound;
-use log::{error, info};
+use log::{debug, error, info};
 use serde::Serialize;
 use signal_hook::consts::SIGINT;
 use signal_hook::iterator::Signals;
@@ -23,10 +23,9 @@ use crate::initialization::init_logger;
 
 mod initialization;
 
-const DEFAULT_N_THREADS: i32 = 32;
+const DEFAULT_N_THREADS: i32 = 4;
 const DEFAULT_CHANNELS: u16 = 6;
 const EXCLUSION_TERMS: [&str; 4] = ["[silence]", "(Silence)", "[BLANK_AUDIO]", "[ Silence ]"];
-
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -65,6 +64,16 @@ struct FullTranscription {
 fn main() -> Result<(), Box<dyn Error>> {
     init_logger()?;
 
+    let matches = command!()
+        .arg(
+            arg!(
+                -m --MODEL_PATH <MODEL_PATH> "The path to the model file"
+            )
+            .required(true)
+            .value_parser(value_parser!(PathBuf)),
+        )
+        .get_matches();
+
     // Set up the signal handler
     let mut signals = Signals::new(&[SIGINT])?;
     std::thread::spawn(move || {
@@ -74,22 +83,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     info!("Number of logical cores is {}", num_cpus::get());
-
-    // Get hostname
-    let hostname = hostname::get()
-        .expect("Failed to get hostname")
-        .into_string()
-        .expect("Failed to convert OsString into String");
-    info!("Hostname: {}", hostname);
-
-    match get_if_addrs() {
-        Ok(if_addrs) => {
-            for if_addr in if_addrs {
-                info!("Interface \"{}\" IP: {}", if_addr.name, if_addr.ip());
-            }
-        }
-        Err(e) => info!("Error getting network interface addresses: {}", e),
-    }
 
     let host = cpal::default_host();
     let device = host.default_input_device().expect("no input device available");
@@ -126,21 +119,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         };
 
-        // Change the while condition
         while !done_recording_clone.load(Ordering::Relaxed) || !is_receiver_empty(&rx) {
-
-            // Change the try_recv to recv, so that we block until a message is available or the channel is closed.
             match rx.recv() {
                 Ok(sample) => {
                     // Write the sample to the WAV file
                     writer.write_sample(sample).unwrap();
-
                     if start_time.elapsed() > Duration::from_secs(60) {
                         if let Err(e) = writer.finalize() {
                             error!("Failed to finalize WAV writer for {}: {}", current_filename, e);
                             return;  // Return from the thread.
                         }
-
+                        info!("Wrote WAV file: {}", current_filename);
                         // Notify about the finished file right after finalizing it.
                         let (lock, cvar) = &*ready_for_transcription_clone;
                         {
@@ -151,8 +140,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     poisoned.into_inner()
                                 }
                             };
-
                             *ready_file = Some(current_filename.clone());
+                            info!("Ready file: {:?}", ready_file);
                         }
                         cvar.notify_one();
 
@@ -180,14 +169,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         info!("wav_writer thread finished...");
     });
 
-    // 1. Instantiate the TranscriptionService after initializing the logger
-    let model_path = "/home/alexwoolford/whisper.cpp/models/ggml-base.en.bin";
-    let transcription_service = Arc::new(TranscriptionService::new(model_path)?);
+    let model_path = matches.get_one::<PathBuf>("MODEL_PATH").unwrap();
+    let model_path_str = model_path.to_str().unwrap();
+    let transcription_service = Arc::new(TranscriptionService::new(model_path_str)?);
 
     let transcription = {
         let ready_for_transcription = Arc::clone(&ready_for_transcription);
         let transcription_service_clone = Arc::clone(&transcription_service);
-
+        info!("Transcription thread started...");
         std::thread::spawn(move || {
             let (lock, cvar) = &*ready_for_transcription;
 
@@ -202,6 +191,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 if let Some(filename) = ready_file.take() {
                     transcription_service_clone.transcribe_audio(&filename);
+                    info!("Transcription finished for {}", filename);
                 }
             }
         })
@@ -272,38 +262,55 @@ struct TranscriptionService {
 impl TranscriptionService {
     fn new(model_path: &str) -> Result<Self, Box<dyn Error>> {
         let ctx = WhisperContext::new(model_path).expect("Failed to load model");
+        info!("Start of transcribe_audio method");
         Ok(TranscriptionService { ctx })
     }
 
     fn transcribe_audio(&self, path: &str) {
+        info!("transcribe_audio: method entry");
+        info!("Transcribing audio file: {}", path);
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
-        params.set_n_threads(DEFAULT_N_THREADS);
+        params.set_n_threads(
+            DEFAULT_N_THREADS);
         params.set_language(Some("en"));
 
         // Read the audio data from the provided path
         info!("Attempting to open file: {}", path);
         let mut reader = match hound::WavReader::open(path) {
-            Ok(r) => r,
+            Ok(r) => {
+                info!("Opened file: {}", path);
+                r
+            }
             Err(e) => {
                 error!("Failed to open WAV file {}: {}", path, e);
+                info!("transcribe_audio: end of method");
                 return;
             }
         };
 
         let audio_data: Vec<f32> = reader.samples::<i32>().map(|s| i32_to_f32(s.unwrap())).collect();
+        info!("Audio data length: {}", audio_data.len());
 
         let spec = reader.spec();
+        info!("Spec: {:?}", spec);
+
         let total_samples = reader.len() as f32;
+        info!("Total samples: {}", total_samples);
+
         let audio_duration_seconds = total_samples / (spec.sample_rate as f32 * spec.channels as f32);
+        info!("Audio duration: {}", audio_duration_seconds);
 
         let transcribe_start = Instant::now();
 
-        // Transcribe the audio using the already loaded ctx from the struct
         let mut state = self.ctx.create_state().expect("failed to create state");
+        info!("State created");
+
         state
             .full(params, &audio_data[..])
             .expect("failed to run model");
+
+        info!("State: {:?}", state);
 
         let num_segments = state
             .full_n_segments()
@@ -320,6 +327,7 @@ impl TranscriptionService {
         let exclusion_set: HashSet<_> = EXCLUSION_TERMS.iter().map(|&s| s.to_string()).collect();
 
         for i in 0..num_segments {
+            debug!("Transcribing segment {} of {}...", i + 1, num_segments);
             match state.full_get_segment_text(i) {
                 Ok(segment) => {
                     let trimmed_text = segment.trim().to_string();
@@ -341,7 +349,7 @@ impl TranscriptionService {
                             end: end_time.to_rfc3339(),
                             text: trimmed_text,
                         };
-
+                        debug!("pushing segment to transcription segments: start: {}, end: {}", segment_info.start, segment_info.end);
                         transcription_segments.push(segment_info);
                     }
                 }
@@ -366,11 +374,12 @@ impl TranscriptionService {
     }
 
     fn save_transcription_to_file(&self, path: &str, content: &str) -> Result<(), std::io::Error> {
-        info!("saving transcription to: {}", path);
+        info!("Saving transcription to: {}", path);
 
         let json_path = path.replace(".wav", ".json");
         let mut file = File::create(json_path)?;
         file.write_all(content.as_bytes())?;
+        info!("Successfully saved transcription to file");
         Ok(())
     }
 }

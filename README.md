@@ -6,10 +6,9 @@ This is a personal project and runs on an [Orange Pi 5B](http://www.orangepi.org
 
 Make sure to set up the appropriate path to the Whisper model:
 
+Include the path to the whisper.cpp base model as an argument:
 
-```rust
-let model_path = "/home/alexwoolford/whisper.cpp/models/ggml-small.en.bin";
-```
+    sound_sense -m /home/alexwoolford/whisper.cpp/models/ggml-base.en.bin
 
 The executable transcribes audio to timestamped JSON files:
 
@@ -31,6 +30,10 @@ The executable transcribes audio to timestamped JSON files:
             {
         ]
     }
+
+It's possible to parse out the text from the metadata with the following jq command:
+
+    jq '.transcriptions[].text' audio_*.json
 
 <!-- 
 - [X] TODO: only create WAV files when there's noise/speech

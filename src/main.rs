@@ -85,7 +85,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     info!("Number of logical cores is {}", num_cpus::get());
 
     let host = cpal::default_host();
-    let device = host.default_input_device().expect("no input device available");
+    let device = match host.default_input_device() {
+        Some(device) => device,
+        None => {
+            error!("No input device available. Exiting.");
+            std::process::exit(1);
+        }
+    };
 
     // stream to file
     let spec = hound::WavSpec {
@@ -345,15 +351,24 @@ impl TranscriptionService {
         state.full(params, &audio_data[..])?;
         info!("State: {:?}", state);
 
-        let num_segments = state
-            .full_n_segments()
-            .expect("failed to get number of segments");
+        let num_segments = match state.full_n_segments() {
+            Ok(segments) => segments,
+            Err(e) => {
+                error!("Failed to get the number of segments: {}", e);
+                return Err(Box::new(e));
+            }
+        };
 
         info!("There were {} segments.", num_segments);
 
         let current_filename = get_filename_with_timestamp();
-        let base_time = Utc.datetime_from_str(&current_filename, "audio_%Y%m%d%H%M%S.wav")
-            .expect("Failed to parse timestamp from filename");
+        let base_time = match Utc.datetime_from_str(&current_filename, "audio_%Y%m%d%H%M%S.wav") {
+            Ok(time) => time,
+            Err(e) => {
+                error!("Failed to parse timestamp from filename {}: {}", current_filename, e);
+                return Err(Box::new(e));  // Return the error wrapped in a Box (or use another appropriate error type)
+            }
+        };
 
         let mut transcription_segments = Vec::new();
 
@@ -367,12 +382,22 @@ impl TranscriptionService {
 
                     // Check if the trimmed text is not in the exclusion set
                     if !exclusion_set.contains(&trimmed_text) {
-                        let start_timestamp = state
-                            .full_get_segment_t0(i)
-                            .expect("failed to get segment start timestamp");
-                        let end_timestamp = state
-                            .full_get_segment_t1(i)
-                            .expect("failed to get segment end timestamp");
+
+                        let start_timestamp = match state.full_get_segment_t0(i) {
+                            Ok(timestamp) => timestamp,
+                            Err(e) => {
+                                error!("Failed to get segment start timestamp for segment {}: {}", i, e);
+                                return Err(Box::new(e));  // Return the error wrapped in a Box (or use another appropriate error type)
+                            }
+                        };
+
+                        let end_timestamp = match state.full_get_segment_t1(i) {
+                            Ok(timestamp) => timestamp,
+                            Err(e) => {
+                                error!("Failed to get segment end timestamp for segment {}: {}", i, e);
+                                return Err(Box::new(e));  // Return the error wrapped in a Box (or use another appropriate error type)
+                            }
+                        };
 
                         let start_time = base_time + ChronoDuration::milliseconds(start_timestamp);
                         let end_time = base_time + ChronoDuration::milliseconds(end_timestamp);

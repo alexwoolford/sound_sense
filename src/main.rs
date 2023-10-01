@@ -123,13 +123,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             match rx.recv() {
                 Ok(sample) => {
                     // Write the sample to the WAV file
-                    writer.write_sample(sample).unwrap();
+                    if let Err(e) = writer.write_sample(sample) {
+                        error!("Failed to write sample to WAV file for {}: {}", current_filename, e);
+                        continue;
+                    }
+
                     if start_time.elapsed() > Duration::from_secs(60) {
                         if let Err(e) = writer.finalize() {
                             error!("Failed to finalize WAV writer for {}: {}", current_filename, e);
                             return;  // Return from the thread.
                         }
+
                         info!("Wrote WAV file: {}", current_filename);
+
                         // Notify about the finished file right after finalizing it.
                         let (lock, cvar) = &*ready_for_transcription_clone;
                         {
@@ -143,12 +149,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                             *ready_file = Some(current_filename.clone());
                             info!("Ready file: {:?}", ready_file);
                         }
+
                         cvar.notify_one();
 
                         start_time = Instant::now();
                         current_filename = get_filename_with_timestamp();
-                        let writer_path = current_filename.clone();
-                        writer = match hound::WavWriter::create(writer_path, spec) {
+                        writer = match hound::WavWriter::create(current_filename.clone(), spec) {
                             Ok(w) => w,
                             Err(e) => {
                                 error!("Failed to create WAV writer for {}: {}", current_filename, e);
@@ -165,12 +171,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        writer.finalize().unwrap();
+        if let Err(e) = writer.finalize() {
+            error!("Failed to finalize WAV writer for {}: {}", current_filename, e);
+        }
         info!("wav_writer thread finished...");
     });
 
-    let model_path = matches.get_one::<PathBuf>("MODEL_PATH").unwrap();
-    let model_path_str = model_path.to_str().unwrap();
+    let model_path = matches.get_one::<PathBuf>("MODEL_PATH")
+        .ok_or_else(|| "MODEL_PATH argument is required")?;
+
+    let model_path_str = model_path.to_str()
+        .ok_or_else(|| "The provided MODEL_PATH contains invalid Unicode")?;
+
     let transcription_service = Arc::new(TranscriptionService::new(model_path_str)?);
 
     let transcription = {
@@ -184,13 +196,29 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if !RUNNING.load(Ordering::Relaxed) {
                     break;
                 }
-                let mut ready_file = lock.lock().unwrap();
+
+                let mut ready_file = match lock.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        error!("Mutex was poisoned. Recovering...");
+                        poisoned.into_inner()
+                    }
+                };
+
                 while ready_file.is_none() && RUNNING.load(Ordering::Relaxed) {
-                    ready_file = cvar.wait(ready_file).unwrap();
+                    ready_file = match cvar.wait(ready_file) {
+                        Ok(guard) => guard,
+                        Err(poisoned) => {
+                            error!("Mutex was poisoned after waiting. Recovering...");
+                            poisoned.into_inner()
+                        }
+                    };
                 }
 
                 if let Some(filename) = ready_file.take() {
-                    transcription_service_clone.transcribe_audio(&filename);
+                    if let Err(e) = transcription_service_clone.transcribe_audio(&filename) {
+                        error!("Failed to transcribe audio for {}: {}", filename, e);
+                    }
                     info!("Transcription finished for {}", filename);
                 }
             }
@@ -261,12 +289,12 @@ struct TranscriptionService {
 
 impl TranscriptionService {
     fn new(model_path: &str) -> Result<Self, Box<dyn Error>> {
-        let ctx = WhisperContext::new(model_path).expect("Failed to load model");
+        let ctx = WhisperContext::new(model_path)?;
         info!("Start of transcribe_audio method");
         Ok(TranscriptionService { ctx })
     }
 
-    fn transcribe_audio(&self, path: &str) {
+    fn transcribe_audio(&self, path: &str) -> Result<(), Box<dyn Error>> {
         info!("transcribe_audio: method entry");
         info!("Transcribing audio file: {}", path);
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
@@ -285,11 +313,19 @@ impl TranscriptionService {
             Err(e) => {
                 error!("Failed to open WAV file {}: {}", path, e);
                 info!("transcribe_audio: end of method");
-                return;
+                return Err(Box::new(e));
             }
         };
 
-        let audio_data: Vec<f32> = reader.samples::<i32>().map(|s| i32_to_f32(s.unwrap())).collect();
+        let audio_data: Vec<f32> = reader.samples::<i32>()
+            .filter_map(|s| match s {
+                Ok(sample) => Some(i32_to_f32(sample)),
+                Err(e) => {
+                    error!("Error reading sample: {}", e);
+                    None
+                }
+            })
+            .collect();
         info!("Audio data length: {}", audio_data.len());
 
         let spec = reader.spec();
@@ -303,13 +339,10 @@ impl TranscriptionService {
 
         let transcribe_start = Instant::now();
 
-        let mut state = self.ctx.create_state().expect("failed to create state");
+        let mut state = self.ctx.create_state()?;
         info!("State created");
 
-        state
-            .full(params, &audio_data[..])
-            .expect("failed to run model");
-
+        state.full(params, &audio_data[..])?;
         info!("State: {:?}", state);
 
         let num_segments = state
@@ -363,14 +396,22 @@ impl TranscriptionService {
         };
 
         // Serialize full_transcription to JSON and save it
-        let json_data = serde_json::to_string_pretty(&full_transcription).unwrap();
-        if let Err(e) = self.save_transcription_to_file(path, &json_data) {
-            error!("Failed to save transcription to a file: {}", e);
+        match serde_json::to_string_pretty(&full_transcription) {
+            Ok(json_data) => {
+                if let Err(e) = self.save_transcription_to_file(path, &json_data) {
+                    error!("Failed to save transcription to a file: {}", e);
+                }
+            },
+            Err(e) => {
+                error!("Failed to serialize full transcription to JSON: {}", e);
+            }
         }
 
         let transcribe_duration = transcribe_start.elapsed();
         let transcribe_duration_seconds = transcribe_duration.as_secs_f32();
         info!("{}, {:.3} seconds of audio, transcribed in {:.3} seconds", path, audio_duration_seconds, transcribe_duration_seconds);
+
+        Ok(())
     }
 
     fn save_transcription_to_file(&self, path: &str, content: &str) -> Result<(), std::io::Error> {

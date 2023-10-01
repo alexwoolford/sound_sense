@@ -48,6 +48,17 @@ fn i32_to_f32(sample: i32) -> f32 {
     sample as f32 / MAX_I32_AS_F32
 }
 
+fn initialize_wav_writer(spec: hound::WavSpec) -> Result<(Instant, String, hound::WavWriter<std::io::BufWriter<std::fs::File>>), Box<dyn std::error::Error>> {
+    let start_time = Instant::now();
+    let current_filename = get_filename_with_timestamp();
+
+    let writer_path = current_filename.clone();
+    let writer = hound::WavWriter::create(writer_path, spec)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+    Ok((start_time, current_filename, writer))
+}
+
 #[derive(Serialize)]
 struct TranscriptionSegment {
     start: String,
@@ -113,17 +124,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     let wav_writer = std::thread::spawn(move || {
         info!("wav_writer thread started...");
 
-        let mut start_time = Instant::now();
-        let mut current_filename = get_filename_with_timestamp();
+        let mut start_time: Instant;
+        let mut current_filename: String;
+        let mut writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>;
 
-        let writer_path = current_filename.clone();
-        let mut writer = match hound::WavWriter::create(writer_path, spec) {
-            Ok(w) => w,
+        match initialize_wav_writer(spec) {
+            Ok((start_time_val, current_filename_val, writer_val)) => {
+                start_time = start_time_val;
+                current_filename = current_filename_val;
+                writer = writer_val;
+            },
             Err(e) => {
-                error!("Failed to create WAV writer: {}", e);
-                return;  // Return from the thread.
+                error!("Failed to initialize WAV writer: {}", e);
+                return;
             }
-        };
+        }
 
         while !done_recording_clone.load(Ordering::Relaxed) || !is_receiver_empty(&rx) {
             match rx.recv() {
@@ -411,7 +426,10 @@ impl TranscriptionService {
                         transcription_segments.push(segment_info);
                     }
                 }
-                Err(_) => {}
+                Err(_) => {
+                    error!("Error getting transcription segment text.");
+                    continue;
+                }
             }
         }
 

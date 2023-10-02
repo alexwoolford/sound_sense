@@ -59,6 +59,23 @@ fn initialize_wav_writer(spec: hound::WavSpec) -> Result<(Instant, String, hound
     Ok((start_time, current_filename, writer))
 }
 
+fn read_and_parse_audio(path: &str) -> Result<(Vec<f32>, hound::WavSpec, f32), Box<dyn Error>> {
+    // Read the audio data from the provided path
+    let mut reader = hound::WavReader::open(path)?;
+    let audio_data: Vec<f32> = reader.samples::<i32>().filter_map(Result::ok).map(i32_to_f32).collect();
+    info!("Audio data length: {}", audio_data.len());
+
+    // Extract audio specifications
+    let spec = reader.spec();
+
+    // Calculate the total number of samples in the audio
+    let total_samples = reader.len() as f32;
+    info!("Total samples: {}", total_samples);
+
+    Ok((audio_data, spec, total_samples))
+}
+
+
 #[derive(Serialize)]
 struct TranscriptionSegment {
     start: String,
@@ -320,40 +337,10 @@ impl TranscriptionService {
         info!("Transcribing audio file: {}", path);
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
-        params.set_n_threads(
-            DEFAULT_N_THREADS);
+        params.set_n_threads(DEFAULT_N_THREADS);
         params.set_language(Some("en"));
 
-        // Read the audio data from the provided path
-        info!("Attempting to open file: {}", path);
-        let mut reader = match hound::WavReader::open(path) {
-            Ok(r) => {
-                info!("Opened file: {}", path);
-                r
-            }
-            Err(e) => {
-                error!("Failed to open WAV file {}: {}", path, e);
-                info!("transcribe_audio: end of method");
-                return Err(Box::new(e));
-            }
-        };
-
-        let audio_data: Vec<f32> = reader.samples::<i32>()
-            .filter_map(|s| match s {
-                Ok(sample) => Some(i32_to_f32(sample)),
-                Err(e) => {
-                    error!("Error reading sample: {}", e);
-                    None
-                }
-            })
-            .collect();
-        info!("Audio data length: {}", audio_data.len());
-
-        let spec = reader.spec();
-        info!("Spec: {:?}", spec);
-
-        let total_samples = reader.len() as f32;
-        info!("Total samples: {}", total_samples);
+        let (audio_data, spec, total_samples) = read_and_parse_audio(path)?;
 
         let audio_duration_seconds = total_samples / (spec.sample_rate as f32 * spec.channels as f32);
         info!("Audio duration: {}", audio_duration_seconds);

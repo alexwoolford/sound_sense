@@ -51,4 +51,6 @@ It's possible to parse out the text from the metadata with the following jq comm
 - [X] TODO: trim text in JSON
 - [ ] TODO: show example of output in README.md
 - [X] TODO: rename transcript filetype to JSON
+- [ ] TODO: use folders to manage files: audio, transcribed_audio, transcription
+- [ ] TODO: add control keys to pause/resume/stop
 -->

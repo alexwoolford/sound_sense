@@ -1,7 +1,4 @@
-use std::collections::HashSet;
 use std::error::Error;
-use std::fs::File;
-use std::io::prelude::*;
 use std::sync::{Arc, Condvar, mpsc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -12,15 +9,18 @@ use std::path::PathBuf;
 use cpal::{SampleRate, StreamConfig};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-use log::{debug, error, info};
+use log::{error, info};
 use serde::Serialize;
 use signal_hook::consts::SIGINT;
 use signal_hook::iterator::Signals;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperState};
 
 use crate::initialization::init_logger;
+use crate::transcription::initialize_wav_writer;
+use crate::transcription::transcription_service::TranscriptionService;
+
 
 mod initialization;
+mod transcription;
 
 const DEFAULT_N_THREADS: i32 = 4;
 const DEFAULT_CHANNELS: u16 = 6;
@@ -42,98 +42,12 @@ fn is_receiver_empty<T>(rx: &mpsc::Receiver<T>) -> bool {
     }
 }
 
-fn i32_to_f32(sample: i32) -> f32 {
-    const MAX_I32_AS_F32: f32 = i32::MAX as f32;
-    sample as f32 / MAX_I32_AS_F32
-}
-
-fn initialize_wav_writer(spec: hound::WavSpec) -> Result<(Instant, String, hound::WavWriter<std::io::BufWriter<std::fs::File>>), Box<dyn std::error::Error>> {
-    let start_time = Instant::now();
-    let current_filename = get_filename_with_timestamp();
-
-    let writer_path = current_filename.clone();
-    let writer = hound::WavWriter::create(writer_path, spec)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-
-    Ok((start_time, current_filename, writer))
-}
-
-fn read_and_parse_audio(path: &str) -> Result<(Vec<f32>, hound::WavSpec, f32), Box<dyn Error>> {
-    // Read the audio data from the provided path
-    let mut reader = hound::WavReader::open(path)?;
-    let audio_data: Vec<f32> = reader.samples::<i32>().filter_map(Result::ok).map(i32_to_f32).collect();
-    info!("Audio data length: {}", audio_data.len());
-
-    // Extract audio specifications
-    let spec = reader.spec();
-
-    // Calculate the total number of samples in the audio
-    let total_samples = reader.len() as f32;
-    info!("Total samples: {}", total_samples);
-
-    Ok((audio_data, spec, total_samples))
-}
-
-fn handle_segment_transcription(
-    state: &WhisperState,
-    i: i32,
-    base_time: &chrono::DateTime<chrono::Utc>,
-    exclusion_set: &HashSet<String>,
-) -> Result<Option<TranscriptionSegment>, Box<dyn std::error::Error>> {
-    debug!("Transcribing segment {}...", i + 1);
-    match state.full_get_segment_text(i) {
-        Ok(segment) => {
-            let trimmed_text = segment.trim().to_string();
-
-            // Check if the trimmed text is not in the exclusion set
-            if !exclusion_set.contains(&trimmed_text) {
-                let start_timestamp = match state.full_get_segment_t0(i) {
-                    Ok(timestamp) => timestamp,
-                    Err(e) => {
-                        error!("Failed to get segment start timestamp for segment {}: {}", i, e);
-                        return Err(Box::new(e));
-                    }
-                };
-
-                let end_timestamp = match state.full_get_segment_t1(i) {
-                    Ok(timestamp) => timestamp,
-                    Err(e) => {
-                        error!("Failed to get segment end timestamp for segment {}: {}", i, e);
-                        return Err(Box::new(e));
-                    }
-                };
-
-                let start_time = *base_time + chrono::Duration::milliseconds(start_timestamp);
-                let end_time = *base_time + chrono::Duration::milliseconds(end_timestamp);
-
-                let segment_info = TranscriptionSegment {
-                    start: start_time.to_rfc3339(),
-                    end: end_time.to_rfc3339(),
-                    text: trimmed_text,
-                };
-                debug!(
-                    "pushing segment to transcription segments: start: {}, end: {}",
-                    segment_info.start, segment_info.end
-                );
-                Ok(Some(segment_info))
-            } else {
-                Ok(None)
-            }
-        }
-        Err(_) => {
-            error!("Error getting transcription segment text.");
-            Ok(None)
-        }
-    }
-}
-
 #[derive(Serialize)]
-struct TranscriptionSegment {
+pub struct TranscriptionSegment {
     start: String,
     end: String,
     text: String,
 }
-
 
 #[derive(Serialize)]
 struct FullTranscription {
@@ -370,108 +284,4 @@ fn main() -> Result<(), Box<dyn Error>> {
     info!("transcription joined, exiting...");
 
     Ok(())
-}
-
-// New struct to hold the WhisperContext
-struct TranscriptionService {
-    ctx: WhisperContext,
-}
-
-impl TranscriptionService {
-    fn new(model_path: &str) -> Result<Self, Box<dyn Error>> {
-        let ctx = WhisperContext::new(model_path)?;
-        info!("Start of transcribe_audio method");
-        Ok(TranscriptionService { ctx })
-    }
-
-    fn transcribe_audio(&self, path: &str) -> Result<(), Box<dyn Error>> {
-        info!("transcribe_audio: method entry");
-        info!("Transcribing audio file: {}", path);
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-
-        params.set_n_threads(DEFAULT_N_THREADS);
-        params.set_language(Some("en"));
-
-        let (audio_data, spec, total_samples) = read_and_parse_audio(path)?;
-
-        let audio_duration_seconds = total_samples / (spec.sample_rate as f32 * spec.channels as f32);
-        info!("Audio duration: {}", audio_duration_seconds);
-
-        let transcribe_start = Instant::now();
-
-        let mut state = self.ctx.create_state()?;
-        info!("State created");
-
-        state.full(params, &audio_data[..])?;
-        info!("State: {:?}", state);
-
-        let num_segments = match state.full_n_segments() {
-            Ok(segments) => segments,
-            Err(e) => {
-                error!("Failed to get the number of segments: {}", e);
-                return Err(Box::new(e));
-            }
-        };
-
-        info!("There were {} segments.", num_segments);
-
-        let current_filename = get_filename_with_timestamp();
-        let base_time = match Utc.datetime_from_str(&current_filename, "audio_%Y%m%d%H%M%S.wav") {
-            Ok(time) => time,
-            Err(e) => {
-                error!("Failed to parse timestamp from filename {}: {}", current_filename, e);
-                return Err(Box::new(e));  // Return the error wrapped in a Box (or use another appropriate error type)
-            }
-        };
-
-        let exclusion_set: HashSet<_> = EXCLUSION_TERMS.iter().map(|&s| s.to_string()).collect();
-        let mut transcription_segments = Vec::new();
-
-        for i in 0..num_segments {
-            match handle_segment_transcription(&state, i, &base_time, &exclusion_set) {
-                Ok(Some(segment_info)) => {
-                    transcription_segments.push(segment_info);
-                }
-                Ok(None) => {
-                    // Log or handle cases where no segment is returned (e.g., excluded segments, etc.)
-                }
-                Err(e) => {
-                    error!("Failed to handle transcription for segment {}: {}", i, e);
-                }
-            }
-        }
-
-        let full_transcription = FullTranscription {
-            file_name: current_filename,
-            transcriptions: transcription_segments,
-        };
-
-        // Serialize full_transcription to JSON and save it
-        match serde_json::to_string_pretty(&full_transcription) {
-            Ok(json_data) => {
-                if let Err(e) = self.save_transcription_to_file(path, &json_data) {
-                    error!("Failed to save transcription to a file: {}", e);
-                }
-            },
-            Err(e) => {
-                error!("Failed to serialize full transcription to JSON: {}", e);
-            }
-        }
-
-        let transcribe_duration = transcribe_start.elapsed();
-        let transcribe_duration_seconds = transcribe_duration.as_secs_f32();
-        info!("{}, {:.3} seconds of audio, transcribed in {:.3} seconds", path, audio_duration_seconds, transcribe_duration_seconds);
-
-        Ok(())
-    }
-
-    fn save_transcription_to_file(&self, path: &str, content: &str) -> Result<(), std::io::Error> {
-        info!("Saving transcription to: {}", path);
-
-        let json_path = path.replace(".wav", ".json");
-        let mut file = File::create(json_path)?;
-        file.write_all(content.as_bytes())?;
-        info!("Successfully saved transcription to file");
-        Ok(())
-    }
 }

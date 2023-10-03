@@ -4,13 +4,20 @@ use std::fs::File;
 use std::io::Write;
 use log::{debug, error, info};
 use std::time::{Instant};
+use chrono::Utc;
 use whisper_rs::WhisperState;
-use crate::{get_filename_with_timestamp, TranscriptionSegment};
+use crate::TranscriptionSegment;
 
 
 pub fn i32_to_f32(sample: i32) -> f32 {
     const MAX_I32_AS_F32: f32 = i32::MAX as f32;
     sample as f32 / MAX_I32_AS_F32
+}
+
+pub fn get_filename_with_timestamp() -> String {
+    let now = Utc::now();
+    let timestamp = now.format("%Y%m%d%H%M%S").to_string();
+    format!("audio_{}.wav", timestamp)
 }
 
 pub fn initialize_wav_writer(spec: hound::WavSpec) -> Result<(Instant, String, hound::WavWriter<std::io::BufWriter<std::fs::File>>), Box<dyn std::error::Error>> {

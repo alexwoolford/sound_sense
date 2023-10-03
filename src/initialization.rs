@@ -3,6 +3,40 @@ use std::io::Write;
 
 use colored::*;
 
+#[derive(Clone)]
+pub struct Config {
+    pub model_path: String,
+    pub default_n_threads: i32,
+    pub default_channels: u16,
+    pub channels: u16,
+    pub sample_rate: u32,
+    pub bits_per_sample: u16,
+    pub exclusion_terms: Vec<String>,
+}
+
+impl Config {
+    pub fn new() -> Self {
+        Self {
+            model_path: "".to_string(),
+            default_n_threads: 4,
+            default_channels: 6,
+
+            // Hound wav encoding configs
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 32,
+
+            exclusion_terms: vec![
+                "[silence]".to_string(),
+                "(Silence)".to_string(),
+                "[BLANK_AUDIO]".to_string(),
+                "[ Silence ]".to_string(),
+            ],
+        }
+    }
+}
+
+
 // Initializes the logger for the application with the provided configuration.
 pub fn init_logger() -> Result<(), Box<dyn Error>> {
 

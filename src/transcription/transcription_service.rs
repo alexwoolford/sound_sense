@@ -1,25 +1,24 @@
 use std::collections::HashSet;
 use std::error::Error;
+use std::path::PathBuf;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext};
 use log::{error, info};
 use std::time::{Instant};
 use chrono::{TimeZone, Utc};
-use crate::{FullTranscription, get_filename_with_timestamp};
-use crate::transcription::{handle_segment_transcription, read_and_parse_audio, save_transcription_to_file};
-use crate::DEFAULT_N_THREADS;
-use crate::EXCLUSION_TERMS;
+use crate::{FullTranscription};
+use crate::transcription::{get_filename_with_timestamp, read_and_parse_audio, handle_segment_transcription, save_transcription_to_file};
+use crate::initialization::Config;
 
 
-// New struct to hold the WhisperContext
-pub(crate) struct TranscriptionService {
+pub struct TranscriptionService {
+    config: Config,
     ctx: WhisperContext,
 }
 
 impl TranscriptionService {
-    pub(crate) fn new(model_path: &str) -> Result<Self, Box<dyn Error>> {
-        let ctx = WhisperContext::new(model_path)?;
-        info!("Start of transcribe_audio method");
-        Ok(TranscriptionService { ctx })
+    pub fn new(model_path: &PathBuf, config: &Config) -> Result<Self, Box<dyn Error>> {
+        let ctx = WhisperContext::new(model_path.to_str().ok_or("Invalid model path")?)?;
+        Ok(TranscriptionService { ctx, config: config.clone() })  // assuming you add a config field to TranscriptionService
     }
 
     pub(crate) fn transcribe_audio(&self, path: &str) -> Result<(), Box<dyn Error>> {
@@ -27,7 +26,7 @@ impl TranscriptionService {
         info!("Transcribing audio file: {}", path);
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
-        params.set_n_threads(DEFAULT_N_THREADS);
+        params.set_n_threads(self.config.default_n_threads);
         params.set_language(Some("en"));
 
         let (audio_data, spec, total_samples) = read_and_parse_audio(path)?;
@@ -62,7 +61,7 @@ impl TranscriptionService {
             }
         };
 
-        let exclusion_set: HashSet<_> = EXCLUSION_TERMS.iter().map(|&s| s.to_string()).collect();
+        let exclusion_set: HashSet<_> = self.config.exclusion_terms.iter().map(|s| s.to_string()).collect();
         let mut transcription_segments = Vec::new();
 
         for i in 0..num_segments {

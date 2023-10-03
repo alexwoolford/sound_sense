@@ -6,7 +6,6 @@ use std::sync::{Arc, Condvar, mpsc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use chrono::Duration as ChronoDuration;
 use chrono::prelude::*;
 use clap::{arg, command, value_parser};
 use std::path::PathBuf;
@@ -17,7 +16,7 @@ use log::{debug, error, info};
 use serde::Serialize;
 use signal_hook::consts::SIGINT;
 use signal_hook::iterator::Signals;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperState};
 
 use crate::initialization::init_logger;
 
@@ -75,6 +74,58 @@ fn read_and_parse_audio(path: &str) -> Result<(Vec<f32>, hound::WavSpec, f32), B
     Ok((audio_data, spec, total_samples))
 }
 
+fn handle_segment_transcription(
+    state: &WhisperState,
+    i: i32,
+    base_time: &chrono::DateTime<chrono::Utc>,
+    exclusion_set: &HashSet<String>,
+) -> Result<Option<TranscriptionSegment>, Box<dyn std::error::Error>> {
+    debug!("Transcribing segment {}...", i + 1);
+    match state.full_get_segment_text(i) {
+        Ok(segment) => {
+            let trimmed_text = segment.trim().to_string();
+
+            // Check if the trimmed text is not in the exclusion set
+            if !exclusion_set.contains(&trimmed_text) {
+                let start_timestamp = match state.full_get_segment_t0(i) {
+                    Ok(timestamp) => timestamp,
+                    Err(e) => {
+                        error!("Failed to get segment start timestamp for segment {}: {}", i, e);
+                        return Err(Box::new(e));
+                    }
+                };
+
+                let end_timestamp = match state.full_get_segment_t1(i) {
+                    Ok(timestamp) => timestamp,
+                    Err(e) => {
+                        error!("Failed to get segment end timestamp for segment {}: {}", i, e);
+                        return Err(Box::new(e));
+                    }
+                };
+
+                let start_time = *base_time + chrono::Duration::milliseconds(start_timestamp);
+                let end_time = *base_time + chrono::Duration::milliseconds(end_timestamp);
+
+                let segment_info = TranscriptionSegment {
+                    start: start_time.to_rfc3339(),
+                    end: end_time.to_rfc3339(),
+                    text: trimmed_text,
+                };
+                debug!(
+                    "pushing segment to transcription segments: start: {}, end: {}",
+                    segment_info.start, segment_info.end
+                );
+                return Ok(Some(segment_info));
+            } else {
+                return Ok(None);
+            }
+        }
+        Err(_) => {
+            error!("Error getting transcription segment text.");
+            return Ok(None);
+        }
+    }
+}
 
 #[derive(Serialize)]
 struct TranscriptionSegment {
@@ -82,6 +133,7 @@ struct TranscriptionSegment {
     end: String,
     text: String,
 }
+
 
 #[derive(Serialize)]
 struct FullTranscription {
@@ -372,50 +424,19 @@ impl TranscriptionService {
             }
         };
 
+        let exclusion_set: HashSet<_> = EXCLUSION_TERMS.iter().map(|&s| s.to_string()).collect();
         let mut transcription_segments = Vec::new();
 
-        let exclusion_set: HashSet<_> = EXCLUSION_TERMS.iter().map(|&s| s.to_string()).collect();
-
         for i in 0..num_segments {
-            debug!("Transcribing segment {} of {}...", i + 1, num_segments);
-            match state.full_get_segment_text(i) {
-                Ok(segment) => {
-                    let trimmed_text = segment.trim().to_string();
-
-                    // Check if the trimmed text is not in the exclusion set
-                    if !exclusion_set.contains(&trimmed_text) {
-
-                        let start_timestamp = match state.full_get_segment_t0(i) {
-                            Ok(timestamp) => timestamp,
-                            Err(e) => {
-                                error!("Failed to get segment start timestamp for segment {}: {}", i, e);
-                                return Err(Box::new(e));  // Return the error wrapped in a Box (or use another appropriate error type)
-                            }
-                        };
-
-                        let end_timestamp = match state.full_get_segment_t1(i) {
-                            Ok(timestamp) => timestamp,
-                            Err(e) => {
-                                error!("Failed to get segment end timestamp for segment {}: {}", i, e);
-                                return Err(Box::new(e));  // Return the error wrapped in a Box (or use another appropriate error type)
-                            }
-                        };
-
-                        let start_time = base_time + ChronoDuration::milliseconds(start_timestamp);
-                        let end_time = base_time + ChronoDuration::milliseconds(end_timestamp);
-
-                        let segment_info = TranscriptionSegment {
-                            start: start_time.to_rfc3339(),
-                            end: end_time.to_rfc3339(),
-                            text: trimmed_text,
-                        };
-                        debug!("pushing segment to transcription segments: start: {}, end: {}", segment_info.start, segment_info.end);
-                        transcription_segments.push(segment_info);
-                    }
+            match handle_segment_transcription(&state, i, &base_time, &exclusion_set) {
+                Ok(Some(segment_info)) => {
+                    transcription_segments.push(segment_info);
                 }
-                Err(_) => {
-                    error!("Error getting transcription segment text.");
-                    continue;
+                Ok(None) => {
+                    // Log or handle cases where no segment is returned (e.g., excluded segments, etc.)
+                }
+                Err(e) => {
+                    error!("Failed to handle transcription for segment {}: {}", i, e);
                 }
             }
         }

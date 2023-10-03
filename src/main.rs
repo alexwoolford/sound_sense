@@ -11,7 +11,7 @@ use clap::{arg, command, value_parser};
 use std::path::PathBuf;
 use cpal::{SampleRate, StreamConfig};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use hound;
+
 use log::{debug, error, info};
 use serde::Serialize;
 use signal_hook::consts::SIGINT;
@@ -115,14 +115,14 @@ fn handle_segment_transcription(
                     "pushing segment to transcription segments: start: {}, end: {}",
                     segment_info.start, segment_info.end
                 );
-                return Ok(Some(segment_info));
+                Ok(Some(segment_info))
             } else {
-                return Ok(None);
+                Ok(None)
             }
         }
         Err(_) => {
             error!("Error getting transcription segment text.");
-            return Ok(None);
+            Ok(None)
         }
     }
 }
@@ -155,7 +155,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .get_matches();
 
     // Set up the signal handler
-    let mut signals = Signals::new(&[SIGINT])?;
+    let mut signals = Signals::new([SIGINT])?;
     std::thread::spawn(move || {
         for _ in signals.forever() {
             RUNNING.store(false, Ordering::Relaxed);
@@ -268,10 +268,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     let model_path = matches.get_one::<PathBuf>("MODEL_PATH")
-        .ok_or_else(|| "MODEL_PATH argument is required")?;
+        .ok_or("MODEL_PATH argument is required")?;
 
     let model_path_str = model_path.to_str()
-        .ok_or_else(|| "The provided MODEL_PATH contains invalid Unicode")?;
+        .ok_or("The provided MODEL_PATH contains invalid Unicode")?;
 
     let transcription_service = Arc::new(TranscriptionService::new(model_path_str)?);
 

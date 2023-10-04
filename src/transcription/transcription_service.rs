@@ -16,7 +16,7 @@ pub struct TranscriptionService {
 }
 
 impl TranscriptionService {
-    pub fn new(model_path: &PathBuf, config: &Config) -> Result<Self, Box<dyn Error>> {
+    pub fn new(model_path: PathBuf, config: &Config) -> Result<Self, Box<dyn Error>> {
         let ctx = WhisperContext::new(model_path.to_str().ok_or("Invalid model path")?)?;
         Ok(TranscriptionService { ctx, config: config.clone() })  // assuming you add a config field to TranscriptionService
     }

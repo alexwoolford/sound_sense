@@ -11,6 +11,7 @@ pub struct Config {
     pub channels: u16,
     pub sample_rate: u32,
     pub bits_per_sample: u16,
+    pub channel_to_capture: usize,
     pub exclusion_terms: Vec<String>,
 }
 
@@ -25,6 +26,7 @@ impl Config {
             channels: 1,
             sample_rate: 16000,
             bits_per_sample: 32,
+            channel_to_capture: 0, // 0 means the first channel
 
             exclusion_terms: vec![
                 "[silence]".to_string(),

@@ -14,7 +14,7 @@ use signal_hook::consts::SIGINT;
 use signal_hook::iterator::Signals;
 
 use crate::initialization::init_logger;
-use crate::transcription::{get_filename_with_timestamp, initialize_wav_writer};
+use crate::transcription::{initialize_wav_writer};
 use crate::transcription::transcription_service::TranscriptionService;
 
 
@@ -205,6 +205,94 @@ fn parse_command_line_args() -> Result<PathBuf, Box<dyn Error>> {
     Ok(model_path)
 }
 
+pub trait WavWriter {
+    fn write_sample(&mut self, sample: i32) -> Result<(), hound::Error>;
+    fn finalize(self) -> Result<(), hound::Error>;
+}
+
+impl WavWriter for hound::WavWriter<std::io::BufWriter<std::fs::File>> {
+    fn write_sample(&mut self, sample: i32) -> Result<(), hound::Error> {
+        self.write_sample(sample)
+    }
+
+    fn finalize(self) -> Result<(), hound::Error> {
+        self.finalize()
+    }
+}
+
+fn write_wav(
+    done_recording: Arc<AtomicBool>,
+    ready_for_transcription: Arc<(Mutex<Option<String>>, Condvar)>,
+    rx: mpsc::Receiver<i32>,
+    mut writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+    mut current_filename: String,
+    spec: hound::WavSpec,
+    mut start_time: Instant,
+) {
+    // Main logic for writing to the WAV file and handling transcription readiness.
+    while !done_recording.load(Ordering::Relaxed) || !is_receiver_empty(&rx) {
+        match rx.recv() {
+            Ok(sample) => {
+                // Write the sample to the WAV file
+                if let Err(e) = writer.write_sample(sample) {
+                    error!("Failed to write sample to WAV file for {}: {}", current_filename, e);
+                    continue;
+                }
+
+                if start_time.elapsed() > Duration::from_secs(60) {
+                    if let Err(e) = writer.finalize() {
+                        error!("Failed to finalize WAV writer for {}: {}", current_filename, e);
+                        return;
+                    }
+
+                    info!("Wrote WAV file: {}", current_filename);
+
+                    // Notify about the finished file right after finalizing it.
+                    let (lock, cvar) = &*ready_for_transcription;
+                    {
+                        let mut ready_file = match lock.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => {
+                                error!("Mutex was poisoned. Recovering...");
+                                poisoned.into_inner()
+                            }
+                        };
+                        *ready_file = Some(current_filename.clone());
+                        info!("Ready file: {:?}", ready_file);
+                    }
+
+                    cvar.notify_one();
+
+                    start_time = Instant::now();
+
+                    writer = match initialize_wav_writer(spec) {
+                        Ok((_, current_filename_val, writer_val)) => {
+                            current_filename = current_filename_val;
+                            *writer_val
+                        },
+                        Err(e) => {
+                            error!("Failed to initialize WAV writer: {}", e);
+                            return;
+                        },
+                    };
+
+                }
+            }
+            Err(_) => {
+                error!("Failed to receive sample. Exiting wav_writer loop.");
+                break;
+            }
+        }
+    }
+
+    // Finalize the WAV writer upon exit of the loop.
+    if let Err(e) = writer.finalize() {
+        error!("Failed to finalize WAV writer for {}: {}", current_filename, e);
+    }
+    info!("wav_writer logic finished...");
+}
+
+
 fn spawn_wav_writer_thread(
     spec: hound::WavSpec,
     done_recording: Arc<AtomicBool>,
@@ -214,15 +302,15 @@ fn spawn_wav_writer_thread(
     std::thread::spawn(move || {
         info!("wav_writer thread started...");
 
-        let mut start_time: Instant;
-        let mut current_filename: String;
-        let mut writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>;
+        let start_time: Instant;
+        let current_filename: String;
+        let writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>;
 
         match initialize_wav_writer(spec) {
             Ok((start_time_val, current_filename_val, writer_val)) => {
                 start_time = start_time_val;
                 current_filename = current_filename_val;
-                writer = writer_val;
+                writer = *writer_val;
             },
             Err(e) => {
                 error!("Failed to initialize WAV writer: {}", e);
@@ -230,62 +318,8 @@ fn spawn_wav_writer_thread(
             }
         }
 
-        while !done_recording.load(Ordering::Relaxed) || !is_receiver_empty(&rx) {
-            match rx.recv() {
-                Ok(sample) => {
-                    // Write the sample to the WAV file
-                    if let Err(e) = writer.write_sample(sample) {
-                        error!("Failed to write sample to WAV file for {}: {}", current_filename, e);
-                        continue;
-                    }
+        write_wav(done_recording, ready_for_transcription, rx, writer, current_filename, spec, start_time);
 
-                    if start_time.elapsed() > Duration::from_secs(60) {
-                        if let Err(e) = writer.finalize() {
-                            error!("Failed to finalize WAV writer for {}: {}", current_filename, e);
-                            return;  // Return from the thread.
-                        }
-
-                        info!("Wrote WAV file: {}", current_filename);
-
-                        // Notify about the finished file right after finalizing it.
-                        let (lock, cvar) = &*ready_for_transcription;
-                        {
-                            let mut ready_file = match lock.lock() {
-                                Ok(guard) => guard,
-                                Err(poisoned) => {
-                                    error!("Mutex was poisoned. Recovering...");
-                                    poisoned.into_inner()
-                                }
-                            };
-                            *ready_file = Some(current_filename.clone());
-                            info!("Ready file: {:?}", ready_file);
-                        }
-
-                        cvar.notify_one();
-
-                        start_time = Instant::now();
-                        current_filename = get_filename_with_timestamp();
-                        writer = match hound::WavWriter::create(current_filename.clone(), spec) {
-                            Ok(w) => w,
-                            Err(e) => {
-                                error!("Failed to create WAV writer for {}: {}", current_filename, e);
-                                return;  // Return from the thread.
-                            }
-                        };
-                    }
-                }
-                Err(_) => {
-                    // Log the error when we cannot receive any more samples (this should happen when tx is dropped).
-                    error!("Failed to receive sample. Exiting wav_writer loop.");
-                    break;
-                }
-            }
-        }
-
-        if let Err(e) = writer.finalize() {
-            error!("Failed to finalize WAV writer for {}: {}", current_filename, e);
-        }
-        info!("wav_writer thread finished...");
     })
 }
 

@@ -6,7 +6,7 @@ use log::{debug, error, info};
 use std::time::{Instant};
 use chrono::Utc;
 use whisper_rs::WhisperState;
-use crate::TranscriptionSegment;
+use crate::{TranscriptionSegment};
 
 
 pub fn i32_to_f32(sample: i32) -> f32 {
@@ -20,15 +20,20 @@ pub fn get_filename_with_timestamp() -> String {
     format!("audio_{}.wav", timestamp)
 }
 
-pub fn initialize_wav_writer(spec: hound::WavSpec) -> Result<(Instant, String, hound::WavWriter<std::io::BufWriter<std::fs::File>>), Box<dyn std::error::Error>> {
+pub fn initialize_wav_writer(spec: hound::WavSpec) -> Result<(Instant, String, Box<hound::WavWriter<std::io::BufWriter<std::fs::File>>>), hound::Error>
+{
     let start_time = Instant::now();
     let current_filename = get_filename_with_timestamp();
 
     let writer_path = current_filename.clone();
-    let writer = hound::WavWriter::create(writer_path, spec)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
-    Ok((start_time, current_filename, writer))
+    let writer = hound::WavWriter::create(writer_path, spec)
+        .map_err(|e| {
+            hound::Error::IoError(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })?;
+
+    Ok((start_time, current_filename, Box::new(writer)))
+    
 }
 
 pub fn read_and_parse_audio(path: &str) -> Result<(Vec<f32>, hound::WavSpec, f32), Box<dyn Error>> {

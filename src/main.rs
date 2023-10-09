@@ -45,126 +45,115 @@ struct FullTranscription {
     transcriptions: Vec<TranscriptionSegment>,
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let config = initialization::Config::new();
-    init_logger()?;
-
-    // Set up the signal handler
-    let mut signals = Signals::new([SIGINT])?;
+fn handle_signals(mut signals: Signals) {
     std::thread::spawn(move || {
         for _ in signals.forever() {
             RUNNING.store(false, Ordering::Relaxed);
         }
     });
+}
 
-    info!("Number of logical cores is {}", num_cpus::get());
+fn initialize_audio_device(host: &cpal::Host) -> Result<cpal::Device, Box<dyn Error>> {
+    match host.default_input_device() {
+        Some(device) => Ok(device),
+        None => Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No input device available.",
+        ))),
+    }
+}
 
-    let host = cpal::default_host();
-    let device = match host.default_input_device() {
-        Some(device) => device,
-        None => {
-            error!("No input device available. Exiting.");
-            std::process::exit(1);
-        }
-    };
 
-    // stream to file
-    let spec = hound::WavSpec {
+fn configure_stream_to_file(config: &initialization::Config) -> hound::WavSpec {
+    hound::WavSpec {
         channels: config.channels,
         sample_rate: config.sample_rate,
         bits_per_sample: config.bits_per_sample,
         sample_format: hound::SampleFormat::Int,
-    };
+    }
+}
 
-    let (tx, rx) = mpsc::channel();
 
-    let ready_for_transcription = Arc::new((Mutex::new(None::<String>), Condvar::new()));
-    let ready_for_transcription_clone = Arc::clone(&ready_for_transcription);
+fn start_transcription_thread(
+    ready_for_transcription: Arc<(Mutex<Option<String>>, Condvar)>,
+    transcription_service: Arc<TranscriptionService>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let (lock, cvar) = &*ready_for_transcription;
 
-    // The flag to indicate that we are done recording and the `wav_writer` should finish its work.
-    let done_recording = Arc::new(AtomicBool::new(false));
+        loop {
+            if !RUNNING.load(Ordering::Relaxed) {
+                break;
+            }
 
-    let wav_writer_thread_handle = spawn_wav_writer_thread(spec, done_recording.clone(), ready_for_transcription_clone, rx);
-
-    let model_path = parse_command_line_args()?;
-
-    let transcription_service = TranscriptionService::new(model_path, &config)?;
-
-    let transcription = {
-        let ready_for_transcription = Arc::clone(&ready_for_transcription);
-        let transcription_service_clone = Arc::clone(&Arc::new(transcription_service));
-        info!("Transcription thread started...");
-        std::thread::spawn(move || {
-            let (lock, cvar) = &*ready_for_transcription;
-
-            loop {
-                if !RUNNING.load(Ordering::Relaxed) {
-                    break;
+            let mut ready_file = match lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    error!("Mutex was poisoned. Recovering...");
+                    poisoned.into_inner()
                 }
+            };
 
-                let mut ready_file = match lock.lock() {
+            while ready_file.is_none() && RUNNING.load(Ordering::Relaxed) {
+                ready_file = match cvar.wait(ready_file) {
                     Ok(guard) => guard,
                     Err(poisoned) => {
-                        error!("Mutex was poisoned. Recovering...");
+                        error!("Mutex was poisoned after waiting. Recovering...");
                         poisoned.into_inner()
                     }
                 };
-
-                while ready_file.is_none() && RUNNING.load(Ordering::Relaxed) {
-                    ready_file = match cvar.wait(ready_file) {
-                        Ok(guard) => guard,
-                        Err(poisoned) => {
-                            error!("Mutex was poisoned after waiting. Recovering...");
-                            poisoned.into_inner()
-                        }
-                    };
-                }
-
-                if let Some(filename) = ready_file.take() {
-                    if let Err(e) = transcription_service_clone.transcribe_audio(&filename) {
-                        error!("Failed to transcribe audio for {}: {}", filename, e);
-                    }
-                    info!("Transcription finished for {}", filename);
-                }
             }
-        })
-    };
 
-    let stream_config = StreamConfig {
-        channels: config.default_channels,
-        sample_rate: SampleRate(config.sample_rate),
-        buffer_size: cpal::BufferSize::Default,
-    };
+            if let Some(filename) = ready_file.take() {
+                if let Err(e) = transcription_service.transcribe_audio(&filename) {
+                    error!("Failed to transcribe audio for {}: {}", filename, e);
+                }
+                info!("Transcription finished for {}", filename);
+            }
+        }
+    })
+}
 
-    let channel_to_capture = config.channel_to_capture;
-    let total_channels = stream_config.channels;
 
-    // Inside your input stream callback, send samples to the writer:
-    let stream = device.build_input_stream(
+fn handle_audio_input_stream(
+    device: &cpal::Device,
+    stream_config: &StreamConfig,
+    channel_to_capture: usize,
+    total_channels: u16,
+    tx: mpsc::Sender<i32>,
+) -> Result<cpal::Stream, Box<dyn Error>> {
+    device.build_input_stream(
         &stream_config,
         move |data: &[i32], _: &cpal::InputCallbackInfo| {
             for (idx, &sample) in data.iter().enumerate() {
                 if idx % (total_channels as usize) == channel_to_capture {
-                    match tx.send(sample) {
-                        Ok(_) => continue,
-                        Err(e) => {
-                            error!("Input stream callback: {}. Terminating.", e);
-                            return;
-                        }
+                    if tx.send(sample).is_err() {
+                        error!("Failed to send sample. Terminating input stream callback.");
+                        return;
                     }
                 }
             }
         },
         |err| error!("An error occurred on stream: {}", err),
         None,
-    )?;
+    )
+        .map_err(|e| Box::new(e) as Box<dyn Error>)
+}
 
-    stream.play()?;
 
+fn run_loop() {
     while RUNNING.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_secs(1));
     }
+}
 
+
+fn cleanup_and_exit(
+    stream: cpal::Stream,
+    done_recording: Arc<AtomicBool>,
+    wav_writer_thread_handle: std::thread::JoinHandle<()>,
+    transcription: std::thread::JoinHandle<()>,
+) -> Result<(), Box<dyn Error>> {
     // Stop the audio input stream FIRST
     drop(stream);
     info!("Stream dropped...");
@@ -185,6 +174,60 @@ fn main() -> Result<(), Box<dyn Error>> {
     info!("transcription joined, exiting...");
 
     Ok(())
+}
+
+
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let config = initialization::Config::new();
+    init_logger()?;
+
+    handle_signals(Signals::new([SIGINT])?);
+
+    info!("Number of logical cores is {}", num_cpus::get());
+
+    let host = cpal::default_host();
+    let device = initialize_audio_device(&host)?;
+
+    let spec = configure_stream_to_file(&config);
+
+    let (tx, rx) = mpsc::channel();
+
+    let ready_for_transcription = Arc::new((Mutex::new(None::<String>), Condvar::new()));
+    let ready_for_transcription_clone = Arc::clone(&ready_for_transcription);
+
+    // The flag to indicate that we are done recording and the `wav_writer` should finish its work.
+    let done_recording = Arc::new(AtomicBool::new(false));
+
+    let wav_writer_thread_handle = spawn_wav_writer_thread(spec, done_recording.clone(), ready_for_transcription_clone, rx);
+
+    let transcription_service = TranscriptionService::new(parse_command_line_args()?, &config)?;
+
+    let transcription = start_transcription_thread(
+        Arc::clone(&ready_for_transcription),
+        Arc::new(transcription_service),
+    );
+
+    let stream_config = StreamConfig {
+        channels: config.default_channels,
+        sample_rate: SampleRate(config.sample_rate),
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    let stream = handle_audio_input_stream(
+        &device,
+        &stream_config,
+        config.channel_to_capture,
+        stream_config.channels,
+        tx
+    )?;
+
+    stream.play()?;
+
+    run_loop();
+
+    cleanup_and_exit(stream, done_recording, wav_writer_thread_handle, transcription)
+
 }
 
 fn parse_command_line_args() -> Result<PathBuf, Box<dyn Error>> {
